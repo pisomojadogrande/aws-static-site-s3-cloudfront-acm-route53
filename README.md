@@ -15,4 +15,4 @@ The rest of the machinery gets created for you, namely:
 
 To get started:
 1. Launch the template at cfn/main.yaml.  You will need to specify the domain name at which you want to run this site, e.g. mysite.example.com; and the Route53 id of the public hosted zone for example.com.  Because a CloudFront distribution takes a while to deploy (15-30m), this step will take some time.
-2. Copy some content into the S3 bucket created by the template.  You will need at least an index.html
+2. Copy some content into the S3 bucket created by the template.  You will need at least an index.html.  Don't forget the `ContentType: text/html`
