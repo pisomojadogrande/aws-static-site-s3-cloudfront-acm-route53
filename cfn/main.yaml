@@ -1,0 +1,171 @@
+Description: Deploy a static site hosted in S3 and fronted by CloudFront
+
+Parameters:
+
+    DomainName:
+        Type: String
+        AllowedPattern: '^(((?!-)[A-Za-z0-9-]{1,62}[A-Za-z0-9])\.)+((?!-)[A-Za-z0-9-]{1,62}[A-Za-z0-9])$'
+        Description: Domain name for your site, like mysite.example.com.  You must have a Route53 public hosted zone for the domain.
+    Route53HostedZoneId:
+        Type: AWS::Route53::HostedZone::Id
+        Description: Route53 id for the public hosted zone on the above domain.  Do not include the /hostedzone/ part.
+
+Resources:
+
+    ContentBucket:
+        Type: AWS::S3::Bucket
+        Properties:
+            PublicAccessBlockConfiguration:
+                BlockPublicAcls: TRUE
+                BlockPublicPolicy: TRUE
+                IgnorePublicAcls: TRUE
+                RestrictPublicBuckets: TRUE
+
+    Certificate:
+        Metadata:
+            Comment: ACM actually should be calling this resource a CertificateRequest so that I can wait for the request to get initiated before starting the custom validation-completion step. However, this resource remains PENDING_CREATE until the validation-completion step happens, so the custom resource Lambda will need to poll for it to show up. 
+        Type: AWS::CertificateManager::Certificate
+        Properties:
+            DomainName: !Ref DomainName
+            ValidationMethod: DNS
+
+    CertificateDNSValidationCustomResourceRole:
+        Metadata:
+            Comment: Because CloudFormation won't make the certificate ARN available until after domain validation has completed, we cannot constrain the List/DescribeCertificates permission.
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - lambda.amazonaws.com
+                      Action:
+                          - 'sts:AssumeRole'
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            Policies:
+                - PolicyName: read-acm-write-route53
+                  PolicyDocument:
+                      Version: 2012-10-17
+                      Statement:
+                          - Sid: ReadAcm
+                            Effect: Allow
+                            Action:
+                                - 'acm:ListCertificates'
+                                - 'acm:DescribeCertificate'
+                            Resource: '*'
+                          - Sid: WriteRoute53
+                            Effect: Allow
+                            Action: 'route53:ChangeResourceRecordSets'
+                            Resource: !Sub arn:aws:route53:::hostedzone/${Route53HostedZoneId}
+
+    CertificateDNSValidationCustomResourceLambdaFunction:
+        Type: AWS::Lambda::Function
+        Properties:
+            Description: Custom resource function for completing an ACM certificate request
+            Role: !GetAtt CertificateDNSValidationCustomResourceRole.Arn
+            Environment:
+                Variables:
+                    DomainName: !Ref DomainName
+                    HostedZoneId: !Ref Route53HostedZoneId
+            Handler: index.handler
+            Runtime: python3.7
+            Timeout: 120
+            Code:
+                ZipFile: !Sub |
+                    import boto3
+                    import cfnresponse
+                    import os
+                    import time
+
+                    from botocore.exceptions import ClientError
+
+                    acm = boto3.client('acm')
+                    r53 = boto3.client('route53')
+
+                    def find_certificate_arn():
+                        next_token = None
+                        while True:
+                            if next_token is None:
+                                r = acm.list_certificates(CertificateStatuses=['PENDING_VALIDATION'])
+                            else:
+                                r = acm.list_certificates(
+                                    CertificateStatuses=['PENDING_VALIDATION'],
+                                    NextToken=next_token
+                                )
+                            certificate_summary = next((cs for cs in r['CertificateSummaryList'] if cs['DomainName'] == os.environ['DomainName']), None)
+                            if certificate_summary is not None:
+                                return certificate_summary['CertificateArn']
+                            if 'NextToken' in r:
+                                next_token = r['NextToken']
+                            else:
+                                return None
+
+                    def handler(event, context):
+                        print(event)
+                        physical_resource_id = event.get('PhysicalResourceId', None)
+
+                        if event['RequestType'] != 'Create':
+                            response_data = {}
+                            response_data['NoOpEvent'] = event['RequestType']
+                            cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physical_resource_id) 
+                            return
+
+                        try:
+                            # We need to poll, because we don't know whether the certificate request has been made
+                            certificate_arn = None
+                            while certificate_arn is None:
+                                certificate_arn = find_certificate_arn()
+                                print('Certificate ARN is not there yet; waiting 10sec')
+                                time.sleep(10)
+                            print(certificate_arn)
+
+                            # ACM will give us the DNS record to write
+                            r = acm.describe_certificate(
+                                CertificateArn=certificate_arn
+                            )
+                            resource_record = r['Certificate']['DomainValidationOptions'][0]['ResourceRecord']
+                            print(resource_record)
+
+                            # Write the DNS record.  If successful, there is up to a 30m wait after this
+                            r = r53.change_resource_record_sets(
+                                HostedZoneId=os.environ['HostedZoneId'],
+                                ChangeBatch={
+                                    'Changes': [
+                                        {
+                                            'Action': 'UPSERT',
+                                            'ResourceRecordSet': {
+                                                'Name': resource_record['Name'],
+                                                'Type': resource_record['Type'],
+                                                'ResourceRecords': [
+                                                    {
+                                                        'Value': resource_record['Value']
+                                                    }
+                                                ],
+                                                'TTL': 60
+                                            }
+                                        }
+                                    ]
+                                }
+                            )
+                            print(r)
+
+                            response_data = {}
+                            response_data['RecordName'] = resource_record['Name']
+                            response_data['RecordValue'] = resource_record['Value']
+                            cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physical_resource_id)
+                        except ClientError as e:
+                            print(e)
+                            response_data = {}
+                            response_data['ErrorCode'] = e.response['Error']['Code']
+                            cfnresponse.send(event, context, cfnresponse.FAILED, response_data, physical_resource_id) 
+
+    CertificateDNSValidationCustomResource:
+        Type: AWS::CloudFormation::CustomResource
+        Properties:
+            ServiceToken: !GetAtt CertificateDNSValidationCustomResourceLambdaFunction.Arn
+
+
+
